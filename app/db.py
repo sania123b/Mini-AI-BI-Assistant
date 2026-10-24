@@ -248,5 +248,5 @@ def run_select(conn, sql, params=()):
     """Execute ONE parameterised statement (sqlite3 rejects stacked statements)."""
     try:
         return [dict(r) for r in conn.execute(sql, params).fetchall()]
-    except sqlite3.Error as e:
+    except (sqlite3.Error, sqlite3.Warning) as e:
         raise DataError(f"Query failed: {e}") from e

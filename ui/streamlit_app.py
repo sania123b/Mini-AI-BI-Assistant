@@ -133,7 +133,7 @@ if st.button("Ask", type="primary"):
             st.markdown(f"- {ex}")
         st.stop()
     st.success(body["answer"])
-    for w in body["warnings"]:
+    for w in body.get("warnings", []):
         st.warning(w)
     df = pd.DataFrame(body["data"])
     st.subheader("Supporting data")
