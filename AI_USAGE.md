@@ -18,6 +18,9 @@
 | Canonical spelling depended on the first row seen (`north ` became the label) | Loader test with mixed case | Choose spellings across all rows (`build_canon`) |
 | "revenue for Smartphone" silently returned total revenue (wrong answer) | Edge-case test | Rule interpreter reports unrecognised words in `warnings`; LLM path rejects unknown entities (422) |
 | "how did revenue change in March" returned a plain total | Edge-case test | Change/compare wording with fewer than two months asks for two months |
+| Real files have 20% bad dates / amounts and my first thresholds rejected the whole column | Upload test with dirty rows | Lenient thresholds for mapped columns; bad rows are rejected individually and listed |
+| Order IDs repeat across line items, so dedup on ID would drop real sales | Reasoned about Superstore-style data | ID only used for dedup when unique |
+| Suggested question used `2026-03`, which the month parser didn't read | Smoke test of the upload API | Parser accepts ISO months; suggestions use month names |
 | Writes through the DB connection | Thought through safety | `mode=ro` plus a SQLite authorizer; tested with DROP/DELETE/UPDATE/PRAGMA/stacked statements |
 
 ## What I'd improve with another day

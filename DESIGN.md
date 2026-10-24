@@ -18,3 +18,11 @@ on top of the read-only connection already in place.
 
 Agentic view: the interpreter is a router choosing a "tool" (intent); each intent is a deterministic tool; the
 service validates the call, executes it and reports the observation.
+
+## Uploads
+```
+CSV bytes -> ingest.parse (limits, delimiter, encoding) -> ingest.auto_map (header aliases + value sniffing)
+          -> ingest.prepare (date format, number/status cleaning, canonical rows) -> db.load_rows -> <random id>.db
+```
+Everything downstream (queries, interpreter, validator, tests) is unchanged: uploads are *adapted to* the canonical schema,
+and the per-dataset `meta.config` (labels, has_units, revenue definition) drives wording and what can be asked.

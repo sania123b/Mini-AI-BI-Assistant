@@ -1,6 +1,8 @@
 """Deterministic, parameterised SQL for each supported intent.
 Only whitelisted identifiers are ever interpolated; all values are bound parameters."""
-from .db import run_select
+import json
+
+from .db import DEFAULT_CONFIG, run_select
 
 BASE = "is_valid = 1 AND status = 'Completed'"
 DIMS = {"product", "region", "category"}
@@ -43,20 +45,29 @@ def by_month(conn, filters):
     return sql, params, run_select(conn, sql, params)
 
 
+def get_config(conn):
+    rows = run_select(conn, "SELECT value FROM meta WHERE key = 'config'")
+    return {**DEFAULT_CONFIG, **json.loads(rows[0]["value"])} if rows else dict(DEFAULT_CONFIG)
+
+
 def distinct_entities(conn):
     out = {}
     for dim in sorted(DIMS):
         rows = run_select(conn, f"SELECT DISTINCT {dim} AS v FROM sales_clean "
-                                f"WHERE is_valid = 1 ORDER BY v")
+                                f"WHERE is_valid = 1 AND {dim} IS NOT NULL AND {dim} != '' ORDER BY v")
         out[dim] = [r["v"] for r in rows]
     out["months"] = [r["month"] for r in run_select(
         conn, "SELECT DISTINCT month FROM sales_clean WHERE is_valid = 1 ORDER BY month")]
     return out
 
 
-def excluded_rows(conn):
+def excluded_rows(conn, limit=200):
     invalid = run_select(conn, "SELECT transaction_id, reject_reason AS reason FROM sales_clean "
-                               "WHERE is_valid = 0 ORDER BY row_num")
+                               "WHERE is_valid = 0 ORDER BY row_num LIMIT ?", (limit,))
     other = run_select(conn, "SELECT transaction_id, status AS reason FROM sales_clean "
-                             "WHERE is_valid = 1 AND status != 'Completed' ORDER BY row_num")
-    return {"invalid_rows": invalid, "non_completed_rows": other}
+                             "WHERE is_valid = 1 AND status != 'Completed' ORDER BY row_num LIMIT ?", (limit,))
+    n_inv = run_select(conn, "SELECT COUNT(*) n FROM sales_clean WHERE is_valid = 0")[0]["n"]
+    n_oth = run_select(conn, "SELECT COUNT(*) n FROM sales_clean "
+                             "WHERE is_valid = 1 AND status != 'Completed'")[0]["n"]
+    return {"invalid_rows": invalid, "non_completed_rows": other,
+            "invalid_total": n_inv, "non_completed_total": n_oth}

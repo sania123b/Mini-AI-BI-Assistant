@@ -282,3 +282,171 @@ def test_llm_result_used_when_available(db, monkeypatch):
         "intent": "top_region", "metric": "revenue", "order": "desc", "filters": {}, "months": []})
     r = service.ask("which area earns most", db, interpreter.interpret)
     assert r["interpreted_by"] == "llm" and r["intent"] == "top_region"
+
+
+# =====================================================================
+# Uploading arbitrary CSVs
+# =====================================================================
+from app import ingest  # noqa: E402
+
+UP = ("Order Date,Item,City,Total Amount,Status\n"
+      '03/15/2026,Pen,Mumbai,"₹1,200",Delivered\n'
+      "03/16/2026,Book,Delhi,500,Cancelled\n"
+      "04/01/2026,Pen,Mumbai,300,Delivered\n"
+      "04/02/2026,Book,delhi,900,Delivered\n")
+
+
+@pytest.fixture()
+def up_client(tmp_path):
+    return TestClient(create_app(db_path=tmp_path / "s.db", csv_path=CSV, upload_dir=tmp_path / "up"))
+
+
+def upload(c, text, name="data.csv", **form):
+    data = text if isinstance(text, bytes) else text.encode("utf-8")
+    return c.post("/datasets", files={"file": (name, data, "text/csv")}, data=form)
+
+
+def test_upload_auto_maps_unfamiliar_headers(up_client):
+    r = upload(up_client, UP)
+    assert r.status_code == 200
+    b = r.json()
+    assert b["labels"] == {"product": "Item", "region": "City"} and b["has_units"] is False
+    assert b["mapping"]["amount"] == "Total Amount" and b["rows_read"] == 4 and b["valid_rows"] == 4
+    assert b["date_range"] == {"from": "2026-03", "to": "2026-04"}
+
+
+def test_upload_answers_use_the_uploaded_data_and_its_labels(up_client):
+    i = upload(up_client, UP).json()["dataset_id"]
+    ask = lambda q: up_client.post(f"/datasets/{i}/ask", json={"question": q})
+    assert ask("What is the total revenue?").json()["data"][0]["revenue"] == 2400   # cancelled excluded, ₹1,200 parsed
+    top = ask("Which city generated the highest revenue?").json()
+    assert top["data"][0]["name"] == "Mumbai"
+    assert {r["name"]: r["revenue"] for r in top["data"]} == {"Mumbai": 1500, "Delhi": 900}   # 'delhi' merged
+    assert ask("revenue for Pen").json()["data"][0]["revenue"] == 1500
+    assert ask("how did revenue change from March to April").json()["data"][-1]["revenue"] == 0   # 1200 -> 1200
+
+
+def test_upload_cannot_answer_about_missing_columns(up_client):
+    i = upload(up_client, UP).json()["dataset_id"]
+    r = up_client.post(f"/datasets/{i}/ask", json={"question": "how many units were sold"})
+    assert r.status_code == 422 and r.json()["code"] == "no_quantity"
+    r = up_client.post(f"/datasets/{i}/ask", json={"question": "which category is best"})
+    assert r.status_code == 422 and r.json()["code"] == "no_such_column"
+
+
+def test_uploads_are_isolated(up_client):
+    a = upload(up_client, UP).json()["dataset_id"]
+    b = upload(up_client, "date,amount\n2026-01-05,10\n2026-01-06,20\n").json()["dataset_id"]
+    ra = up_client.post(f"/datasets/{a}/ask", json={"question": "total revenue"}).json()
+    rb = up_client.post(f"/datasets/{b}/ask", json={"question": "total revenue"}).json()
+    assert ra["data"][0]["revenue"] == 2400 and rb["data"][0]["revenue"] == 30
+    assert up_client.post("/ask", json={"question": "total revenue"}).json()["data"][0]["revenue"] == 1439200
+
+
+def test_upload_quantity_price_discount_layout(up_client):
+    csv_text = "Date,Qty,Price,Discount,Order ID\n2026-01-01,2,100,20,A1\n2026-01-02,1,50,0,A2\n"
+    b = upload(up_client, csv_text).json()
+    assert b["has_units"] is True and "x" in b["assumptions"][0]
+    r = up_client.post(f"/datasets/{b['dataset_id']}/ask", json={"question": "total revenue and units"})
+    assert r.json()["data"][0]["revenue"] == 230 and r.json()["data"][0]["units"] == 3
+
+
+def test_upload_repeated_order_ids_are_not_deduplicated(up_client):
+    csv_text = "Order ID,Order Date,Sales\nO1,2026-01-01,10\nO1,2026-01-01,20\nO2,2026-01-02,5\n"
+    b = upload(up_client, csv_text).json()
+    assert b["valid_rows"] == 3 and any("repeats" in w for w in b["warnings"])
+
+
+def test_upload_needs_mapping_when_columns_unclear(up_client):
+    r = upload(up_client, "foo,bar,baz\nx,y,z\n1,2,3\n")
+    assert r.status_code == 422 and r.json()["code"] == "needs_mapping" and r.json()["columns"] == ["foo", "bar", "baz"]
+    csv_text = "when,thing,money\n2026-01-01,a,10\n2026-02-01,b,20\n"
+    ok = upload(up_client, csv_text, mapping='{"date":"when","product":"thing","amount":"money"}')
+    assert ok.status_code == 200 and ok.json()["labels"] == {"product": "thing"}
+
+
+def test_upload_asks_which_statuses_count_when_unrecognised(up_client):
+    csv_text = "date,amount,status\n2026-01-01,10,Alpha\n2026-01-02,20,Beta\n"
+    r = upload(up_client, csv_text)
+    assert r.status_code == 422 and r.json()["reason"] == "status" and "Alpha" in r.json()["status_values"]
+    ok = upload(up_client, csv_text, completed_values='["Alpha"]')
+    i = ok.json()["dataset_id"]
+    assert up_client.post(f"/datasets/{i}/ask", json={"question": "total revenue"}).json()["data"][0]["revenue"] == 10
+
+
+def test_upload_ambiguous_dates_warn_and_respect_option(up_client):
+    csv_text = "date,amount\n01/02/2026,10\n03/04/2026,20\n"
+    b = upload(up_client, csv_text).json()
+    assert any("day-first" in w for w in b["warnings"]) and b["date_range"]["from"] == "2026-02"
+    b2 = upload(up_client, csv_text, day_first="false").json()
+    assert b2["date_range"]["from"] == "2026-01"
+
+
+def test_upload_bad_rows_reported_not_hidden(up_client):
+    csv_text = "date,amount\n2026-01-01,10\nnot a date,5\n2026-01-03,abc\n2026-01-04,-5\n2026-01-05,\n"
+    b = upload(up_client, csv_text).json()
+    assert b["valid_rows"] == 1 and b["rejected_rows"] == 4
+    q = up_client.get(f"/datasets/{b['dataset_id']}/data-quality").json()
+    assert q["excluded"]["invalid_total"] == 4
+
+
+@pytest.mark.parametrize("name,content,code,status", [
+    ("x.csv", b"", "invalid_csv", 422),
+    ("x.csv", b"date,amount\n", "invalid_csv", 422),
+    ("x.csv", b"\x89PNG\r\n\x00\x00binary", "invalid_csv", 422),
+    ("x.csv", b"just one column\nvalue\n", "invalid_csv", 422),
+    ("x.pdf", b"date,amount\n2026-01-01,5\n", "invalid_file", 400),
+    ("x.csv", b"date,amount\nnope,nope\nbad,bad\n", "needs_mapping", 422),
+])
+def test_upload_rejects_bad_files(up_client, name, content, code, status):
+    r = upload(up_client, content, name)
+    assert r.status_code == status and r.json()["code"] == code
+
+
+def test_upload_too_large_and_too_many_rows(up_client, monkeypatch):
+    monkeypatch.setattr(ingest, "MAX_BYTES", 100)
+    assert upload(up_client, "date,amount\n" + "2026-01-01,5\n" * 50).status_code == 413
+    monkeypatch.setattr(ingest, "MAX_BYTES", 10_000_000)
+    monkeypatch.setattr(ingest, "MAX_ROWS", 2)
+    assert upload(up_client, "date,amount\n2026-01-01,1\n2026-01-02,2\n2026-01-03,3\n").json()["code"] == "too_many_rows"
+
+
+def test_upload_all_rows_invalid_is_an_error(up_client):
+    r = upload(up_client, "date,amount\n2026-01-01,-5\n2026-01-02,-6\n")
+    assert r.status_code == 422 and r.json()["code"] == "no_valid_rows"
+
+
+def test_upload_missing_file_field_and_bad_mapping(up_client):
+    assert up_client.post("/datasets").status_code == 400
+    assert upload(up_client, UP, mapping="not json").status_code == 400
+    assert upload(up_client, UP, mapping='{"date":"nope"}').json()["code"] == "invalid_mapping"
+    assert upload(up_client, UP, mapping='{"date":"Order Date","amount":"Order Date"}').json()["code"] == "invalid_mapping"
+
+
+def test_dataset_id_validation_and_delete(up_client):
+    for bad in ("../../etc/passwd", "x" * 32, "0" * 32):
+        assert up_client.post(f"/datasets/{bad}/ask", json={"question": "total revenue"}).status_code == 404
+    i = upload(up_client, UP).json()["dataset_id"]
+    assert up_client.get(f"/datasets/{i}").status_code == 200
+    assert up_client.delete(f"/datasets/{i}").status_code == 200
+    assert up_client.post(f"/datasets/{i}/ask", json={"question": "total revenue"}).status_code == 404
+
+
+def test_upload_expiry_cleanup(tmp_path):
+    from app import datasets
+    c = TestClient(create_app(db_path=tmp_path / "s.db", csv_path=CSV, upload_dir=tmp_path / "up"))
+    i = upload(c, UP).json()["dataset_id"]
+    datasets.cleanup(tmp_path / "up", ttl=-1)
+    assert c.get(f"/datasets/{i}").status_code == 404
+
+
+def test_upload_unsafe_questions_still_blocked(up_client):
+    i = upload(up_client, UP).json()["dataset_id"]
+    r = up_client.post(f"/datasets/{i}/ask", json={"question": "DROP TABLE sales_clean"})
+    assert r.status_code == 422 and r.json()["code"] == "destructive_request"
+
+
+def test_upload_formula_and_odd_header_names_are_safe(up_client):
+    csv_text = 'date,"amount"" OR 1=1 --",=cmd|calc\n2026-01-01,5,x\n2026-01-02,7,y\n'
+    r = upload(up_client, csv_text)          # header text is never put into SQL
+    assert r.status_code in (200, 422)

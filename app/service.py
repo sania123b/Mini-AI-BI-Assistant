@@ -12,9 +12,6 @@ MAX_LEN = 500
 EXAMPLES = ["What is the total revenue?", "Which product generated the highest revenue?",
             "What is the monthly revenue trend?", "Which region generated the highest sales?",
             "How did revenue change between February and March?"]
-ASSUMPTIONS = ["Revenue = quantity x unit price - discount (discount treated as a per-line amount).",
-               "Only valid orders with status 'Completed' are counted; returned, cancelled and "
-               "invalid rows are excluded (listed under 'excluded')."]
 
 _DESTRUCTIVE = re.compile(
     r"\b(drop|delete|truncate|alter|attach|pragma|grant|exec)\b|"
@@ -71,7 +68,7 @@ def _resolve(kind, value, entities):
                    available=values)
 
 
-def validate_intent(spec, entities):
+def validate_intent(spec, entities, config):
     """Never trust the interpreter (LLM or rules): re-validate everything."""
     if not isinstance(spec, dict) or spec.get("intent") not in INTENTS:
         raise AppError(422, "unsupported_question", "I couldn't map that to a supported analysis.",
@@ -80,6 +77,13 @@ def validate_intent(spec, entities):
         raise AppError(422, "unsupported_question",
                        spec.get("reason") or "I can't answer that from the sales data.", examples=EXAMPLES)
     metric = spec.get("metric") if spec.get("metric") in ("revenue", "units") else "revenue"
+    if metric == "units" and not config.get("has_units", True):
+        raise AppError(422, "no_quantity", "This dataset has no quantity column, so I can't calculate "
+                       "units. Ask about revenue instead.", examples=EXAMPLES)
+    if spec["intent"].startswith("top_") and spec["intent"][4:] not in config["labels"]:
+        dim = spec["intent"][4:]
+        raise AppError(422, "no_such_column", f"This dataset has no {dim} column, so I can't break "
+                       "results down that way.", examples=EXAMPLES)
     order = spec.get("order") if spec.get("order") in ("asc", "desc") else "desc"
     years = [int(m[:4]) for m in entities["months"]] or [2026]
     default_year, notes, assumed_year = max(years), [], False
@@ -113,46 +117,46 @@ def validate_intent(spec, entities):
     return spec["intent"], metric, order, filters, months, notes
 
 
-def _scope(filters):
+def _scope(filters, labels):
     parts = []
     if filters.get("month"):
         parts.append("in " + label(filters["month"]))
-    for k in ("product", "category"):
-        if filters.get(k):
-            parts.append(f"for {filters[k]}")
-    if filters.get("region"):
-        parts.append(f"in the {filters['region']} region")
+    dims = [f"{labels.get(k, k)} '{filters[k]}'" for k in ("product", "category", "region") if filters.get(k)]
+    if dims:
+        parts.append("for " + ", ".join(dims))
     return (" " + " ".join(parts)) if parts else ""
 
 
-def run(intent, metric, order, filters, months, conn):
+def run(intent, metric, order, filters, months, conn, labels, has_units):
     mname = "units sold" if metric == "units" else "revenue"
     if intent == "total_revenue":
         sql, params, rows = queries.total(conn, filters)
         r = rows[0]
         if r["orders"] == 0:
-            return sql, params, rows, f"No completed sales found{_scope(filters)}."
-        extra = f"revenue {fmt(r['revenue'])}" if metric == "units" else f"{fmt(r['units'])} units"
+            return sql, params, rows, f"No completed sales found{_scope(filters, labels)}."
+        extra = (f"revenue {fmt(r['revenue'])}" if metric == "units"
+                 else f"{fmt(r['units'])} units" if has_units else "")
+        extra = f" ({extra})" if extra else ""
         val = fmt(r["units"] if metric == "units" else r["revenue"])
-        return sql, params, rows, (f"Total {mname}{_scope(filters)} is {val} from {r['orders']} "
-                                   f"completed orders ({extra}).")
+        return sql, params, rows, (f"Total {mname}{_scope(filters, labels)} is {val} from {r['orders']} "
+                                   f"completed orders{extra}.")
     if intent.startswith("top_"):
         dim = intent[4:]
         sql, params, rows = queries.top(conn, dim, metric, order, filters)
         if not rows:
-            return sql, params, rows, f"No completed sales found{_scope(filters)}."
+            return sql, params, rows, f"No completed sales found{_scope(filters, labels)}."
         best = rows[0][metric]
         winners = [r["name"] for r in rows if r[metric] == best]
         word = "highest" if order == "desc" else "lowest"
         if len(winners) == 1:
-            txt = f"{winners[0]} has the {word} {mname}{_scope(filters)}: {fmt(best)}."
+            txt = f"{winners[0]} has the {word} {mname}{_scope(filters, labels)}: {fmt(best)}."
         else:
-            txt = f"{' and '.join(winners)} are tied for the {word} {mname}{_scope(filters)}: {fmt(best)} each."
+            txt = f"{' and '.join(winners)} are tied for the {word} {mname}{_scope(filters, labels)}: {fmt(best)} each."
         return sql, params, rows, txt
     if intent == "monthly_trend":
         sql, params, rows = queries.by_month(conn, filters)
         if not rows:
-            return sql, params, rows, f"No completed sales found{_scope(filters)}."
+            return sql, params, rows, f"No completed sales found{_scope(filters, labels)}."
         prev = None
         for r in rows:
             cur = r[metric]
@@ -161,11 +165,14 @@ def run(intent, metric, order, filters, months, conn):
             prev = cur
         hi = max(rows, key=lambda r: r[metric])
         lo = min(rows, key=lambda r: r[metric])
+        if hi[metric] == lo[metric] and len(rows) > 1:
+            return sql, params, rows, (f"Monthly {mname}{_scope(filters, labels)} is the same every month "
+                                       f"({fmt(hi[metric])}) from {label(rows[0]['month'])} to {label(rows[-1]['month'])}.")
         if len(rows) == 1:
             return sql, params, rows, (f"Only one month has data ({label(rows[0]['month'])}: "
                                        f"{fmt(rows[0][metric])}), so no trend can be computed.")
         return sql, params, rows, (
-            f"Monthly {mname}{_scope(filters)} from {label(rows[0]['month'])} to {label(rows[-1]['month'])}: "
+            f"Monthly {mname}{_scope(filters, labels)} from {label(rows[0]['month'])} to {label(rows[-1]['month'])}: "
             f"highest in {label(hi['month'])} ({fmt(hi[metric])}), lowest in {label(lo['month'])} "
             f"({fmt(lo[metric])}).")
     # month_comparison
@@ -180,7 +187,7 @@ def run(intent, metric, order, filters, months, conn):
     diff = round(b - a, 2)
     verb = "rose" if diff > 0 else "fell" if diff < 0 else "was unchanged"
     pct = "" if a == 0 else f" ({diff / a * 100:+.1f}%)"
-    base = (f"{mname.capitalize()}{_scope(filters)} {verb} from {fmt(a)} in {label(months[0])} to "
+    base = (f"{mname.capitalize()}{_scope(filters, labels)} {verb} from {fmt(a)} in {label(months[0])} to "
             f"{fmt(b)} in {label(months[1])}: {'+' if diff > 0 else '-' if diff < 0 else ''}{fmt(abs(diff))}{pct}.")
     if a == 0:
         base += f" There were no completed sales in {label(months[0])}, so a percentage change isn't defined."
@@ -197,10 +204,13 @@ def ask(question, db_path, interpreter=interpret):
     try:
         conn = connect(db_path)
         try:
+            config = queries.get_config(conn)
             entities = queries.distinct_entities(conn)
+            entities["labels"] = config["labels"]
             spec, source, warnings = interpreter(question, entities)
-            intent, metric, order, filters, months, notes = validate_intent(spec, entities)
-            sql, params, rows, answer = run(intent, metric, order, filters, months, conn)
+            intent, metric, order, filters, months, notes = validate_intent(spec, entities, config)
+            sql, params, rows, answer = run(intent, metric, order, filters, months, conn,
+                                            config["labels"], config["has_units"])
             excluded = queries.excluded_rows(conn)
         finally:
             conn.close()
@@ -209,7 +219,8 @@ def ask(question, db_path, interpreter=interpret):
     if spec.get("ignored"):
         warnings = warnings + ["Ignored words I did not recognise: " + ", ".join(spec["ignored"]) +
                                ". Check that the answer matches what you meant."]
-    assumptions = list(ASSUMPTIONS) + notes
+    assumptions = [config["revenue_definition"], config["status_note"]] + notes
+    warnings = warnings + list(config.get("warnings", []))
     if re.search(r"\bsales\b", question, re.I) and metric == "revenue":
         assumptions.append("'Sales' interpreted as revenue (ask for 'units' to get quantities).")
     return {"status": "ok", "answer": answer, "intent": intent, "interpreted_by": source,
