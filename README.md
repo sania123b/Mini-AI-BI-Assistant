@@ -724,6 +724,34 @@ These are future enhancements, not claims about existing functionality.
 
 ---
 
+
+## What Makes This Project Different?
+
+### Flexible CSV-Based Data Analysis
+
+Unlike a dashboard built around a single fixed dataset, this project is designed to support analysis of additional CSV files, making it adaptable to different business scenarios.
+
+- **Bring Your Own CSV:** Load another dataset instead of being restricted to the sample sales data.
+- **Data Quality Evaluation:** Identify missing values, invalid records, and potential data inconsistencies before analysis.
+- **Business Insights:** Evaluate supported metrics, compare categories, and identify trends based on the available dataset.
+- **Evidence-Backed Answers:** Return calculated results and supporting data so users can understand how an answer was derived.
+- **Extensible Design:** Build on the existing data-processing and analytics pipeline to support additional datasets and business use cases.
+
+### Potential Use Cases
+
+The same approach can be extended to datasets involving:
+
+| Dataset | Possible analysis |
+|---|---|
+| Sales | Revenue, product performance, regional trends |
+| Inventory | Stock levels, product availability |
+| Customer data | Customer distribution and purchase patterns |
+| Expenses | Category-wise spending and cost trends |
+
+**Current scope:** CSV files must contain columns and data types supported by the application's ingestion and analytics logic. Fully automatic interpretation of arbitrary CSV schemas would require additional schema detection and query-mapping functionality.
+
+
+
 ## Conclusion
 
 The Mini AI Business Intelligence Assistant demonstrates a practical approach to combining AI-assisted language understanding with conventional database engineering.
